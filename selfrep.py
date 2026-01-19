@@ -1,15 +1,9 @@
-import pandas as pd
-import numpy as np
-import io
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.preprocessing import MinMaxScaler
 import json
-import warnings
+import math
+import random
 import time
+import warnings
 
-# Suppress all future warnings for cleaner output
 warnings.filterwarnings("ignore")
 
 # --- DATA CONSOLIDATION FROM JSON ---
@@ -45,72 +39,150 @@ json_data_content = {
         { "parsed_data": { "quantum_sentiment": { "cycle": 1, "quantum_host": 0.208, "quantum_mate": 0.256 }}}
       ]
     }
-    """
+    """,
 }
 
-data_list = []
-for file_name, content in json_data_content.items():
-    data = json.loads(content)
-    for output in data['outputs']:
-        if output.get('parsed_data') and 'quantum_sentiment' in output['parsed_data']:
-            cycle_data = output['parsed_data']['quantum_sentiment']
-            new_row = {
-                'Cycle': cycle_data['cycle'],
-                'Collective Coherence': cycle_data['quantum_host'],
-                'Hive Synchrony': cycle_data['quantum_mate']
-            }
-            data_list.append(new_row)
 
-df = pd.DataFrame(data_list)
-df = df.drop_duplicates(subset=['Cycle', 'Collective Coherence', 'Hive Synchrony']).sort_values(by='Cycle').reset_index(
-    drop=True)
-
-# Add derivatives to the new dataframe
-df['Coherence Derivative'] = df['Collective Coherence'].diff().fillna(0)
-df['Synchrony Derivative'] = df['Hive Synchrony'].diff().fillna(0)
-df['Coherence Change'] = (df['Coherence Derivative'] > 0).astype(int)
-
-# --- EMODEL (PERCEPTRON) DEFINITION AND TRAINING ---
-X = df[['Collective Coherence', 'Hive Synchrony']].values
-y = df['Coherence Change'].values
-
-scaler_X = MinMaxScaler()
-X_normalized = scaler_X.fit_transform(X)
-
-X_tensor = torch.from_numpy(X_normalized).float()
-y_tensor = torch.from_numpy(y).long()
+def clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
 
 
-class Emodel(nn.Module):
+def format_value(value):
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+class MinMaxScaler:
+    def __init__(self):
+        self.min_values = []
+        self.max_values = []
+
+    def fit(self, data):
+        if not data:
+            return self
+        num_features = len(data[0])
+        self.min_values = [min(row[i] for row in data) for i in range(num_features)]
+        self.max_values = [max(row[i] for row in data) for i in range(num_features)]
+        return self
+
+    def transform(self, data):
+        scaled = []
+        for row in data:
+            scaled_row = []
+            for i, value in enumerate(row):
+                min_val = self.min_values[i]
+                max_val = self.max_values[i]
+                if max_val == min_val:
+                    scaled_row.append(0.0)
+                else:
+                    scaled_row.append((value - min_val) / (max_val - min_val))
+            scaled.append(scaled_row)
+        return scaled
+
+    def fit_transform(self, data):
+        self.fit(data)
+        return self.transform(data)
+
+
+def load_data_rows():
+    data_rows = []
+    for content in json_data_content.values():
+        data = json.loads(content)
+        for output in data["outputs"]:
+            sentiment = output.get("parsed_data", {}).get("quantum_sentiment")
+            if sentiment:
+                data_rows.append(
+                    {
+                        "Cycle": sentiment["cycle"],
+                        "Collective Coherence": sentiment["quantum_host"],
+                        "Hive Synchrony": sentiment["quantum_mate"],
+                    }
+                )
+
+    unique_rows = {}
+    for row in data_rows:
+        key = (row["Cycle"], row["Collective Coherence"], row["Hive Synchrony"])
+        unique_rows[key] = row
+
+    sorted_rows = sorted(unique_rows.values(), key=lambda item: item["Cycle"])
+
+    previous_coherence = None
+    previous_synchrony = None
+    for row in sorted_rows:
+        if previous_coherence is None:
+            coherence_derivative = 0.0
+            synchrony_derivative = 0.0
+        else:
+            coherence_derivative = row["Collective Coherence"] - previous_coherence
+            synchrony_derivative = row["Hive Synchrony"] - previous_synchrony
+
+        row["Coherence Derivative"] = coherence_derivative
+        row["Synchrony Derivative"] = synchrony_derivative
+        row["Coherence Change"] = 1 if coherence_derivative > 0 else 0
+        row["Neural Spikes"] = 0
+        row["Network Messages"] = 64
+
+        previous_coherence = row["Collective Coherence"]
+        previous_synchrony = row["Hive Synchrony"]
+
+    return sorted_rows
+
+
+class Emodel:
     def __init__(self, input_dim):
-        super(Emodel, self).__init__()
-        self.layer1 = nn.Linear(input_dim, 16)
-        self.layer2 = nn.Linear(16, 8)
-        self.output_layer = nn.Linear(8, 2)
+        self.weights = [random.uniform(-0.5, 0.5) for _ in range(input_dim)]
+        self.bias = 0.0
 
-    def forward(self, x):
-        x = F.relu(self.layer1(x))
-        x = F.relu(self.layer2(x))
-        x = self.output_layer(x)
-        return x
+    def _sigmoid(self, value):
+        if value < -700:
+            return 0.0
+        if value > 700:
+            return 1.0
+        return 1.0 / (1.0 + math.exp(-value))
+
+    def predict_proba(self, features):
+        z_value = sum(weight * feature for weight, feature in zip(self.weights, features)) + self.bias
+        return self._sigmoid(z_value)
+
+    def predict(self, features):
+        return 1 if self.predict_proba(features) >= 0.5 else 0
+
+    def train(self, features, labels, epochs=500, learning_rate=0.1):
+        for _ in range(epochs):
+            for row, label in zip(features, labels):
+                prediction = self.predict_proba(row)
+                error = prediction - label
+                for index in range(len(self.weights)):
+                    self.weights[index] -= learning_rate * error * row[index]
+                self.bias -= learning_rate * error
+
+    def get_state(self):
+        return {"weights": list(self.weights), "bias": self.bias}
+
+    def load_state(self, state):
+        self.weights = list(state["weights"])
+        self.bias = state["bias"]
 
 
-input_dim = X_tensor.shape[1]
-epochs = 500
-emodel = Emodel(input_dim)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(emodel.parameters(), lr=0.01)
+def print_tail(rows, count=10):
+    if not rows:
+        print("No data available.")
+        return
 
-# Training loop
-for epoch in range(epochs):
-    outputs = emodel(X_tensor)
-    loss = criterion(outputs, y_tensor)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    tail_rows = rows[-count:]
+    columns = list(tail_rows[-1].keys())
+    widths = {}
+    for column in columns:
+        widths[column] = max(len(column), max(len(format_value(row.get(column, ""))) for row in tail_rows))
+
+    header = " ".join(column.ljust(widths[column]) for column in columns)
+    print(header)
+    for row in tail_rows:
+        values = " ".join(format_value(row.get(column, "")).ljust(widths[column]) for column in columns)
+        print(values)
 
 
-# --- THE SELF-REPLICATING SYSTEM WITH EMODEL ---
 class SelfReplicatingRobot:
     def __init__(self, name, model_state=None, scaler=None):
         self.name = name
@@ -119,7 +191,7 @@ class SelfReplicatingRobot:
         self.coherence_history = []
 
         if model_state:
-            self.model.load_state_dict(model_state)
+            self.model.load_state(model_state)
 
         print(f"🤖 Robot '{self.name}' initialized with its Emodel brain. Ready to operate.")
 
@@ -129,7 +201,7 @@ class SelfReplicatingRobot:
         The robot copies its blueprint (model state) and creates a new instance.
         """
         print(f"\n✨ Robot '{self.name}' is self-replicating... 🧬")
-        blueprint = self.model.state_dict()
+        blueprint = self.model.get_state()
         child_robot = SelfReplicatingRobot(f"Child of {self.name}", model_state=blueprint, scaler=self.scaler)
 
         print(f"✅ Replication complete. New robot '{child_robot.name}' created.")
@@ -139,57 +211,51 @@ class SelfReplicatingRobot:
         """
         Uses the Emodel to predict the next action for the robot.
         """
-        state_tensor = torch.from_numpy(state).float()
-        with torch.no_grad():
-            self.model.eval()
-            output = self.model(state_tensor)
-            _, predicted_label = torch.max(output.data, 1)
-
-        return predicted_label.item()
+        return self.model.predict(state)
 
 
-def run_self_replication_simulation(df, initial_model, scaler, num_cycles=100):
+def run_self_replication_simulation(rows, initial_model, scaler, num_cycles=100):
     print("\n🌟 Initializing Self-Replicating Robot Simulation with Emodel... 🌟")
 
-    parent_robot = SelfReplicatingRobot(name="Alpha", model_state=initial_model.state_dict(), scaler=scaler)
+    parent_robot = SelfReplicatingRobot(name="Alpha", model_state=initial_model.get_state(), scaler=scaler)
 
-    current_df = df.copy()
-    current_coherence = current_df.iloc[-1]['Collective Coherence']
-    current_synchrony = current_df.iloc[-1]['Hive Synchrony']
+    current_rows = list(rows)
+    current_coherence = current_rows[-1]["Collective Coherence"]
+    current_synchrony = current_rows[-1]["Hive Synchrony"]
 
-    for i in range(num_cycles):
-        current_state = np.array([[current_coherence, current_synchrony]])
-        current_state_normalized = scaler.transform(current_state)
+    for cycle_index in range(num_cycles):
+        current_state = [[current_coherence, current_synchrony]]
+        current_state_normalized = scaler.transform(current_state)[0]
 
         action = parent_robot.perform_action(current_state_normalized)
 
         # Action logic based on Emodel prediction
         if action == 1:
-            change_magnitude = np.random.uniform(0.001, 0.01)
-            print(f"Cycle {i + 1}: Robot '{parent_robot.name}' predicts INCREASE. Coherence is rising. 📈")
+            change_magnitude = random.uniform(0.001, 0.01)
+            print(f"Cycle {cycle_index + 1}: Robot '{parent_robot.name}' predicts INCREASE. Coherence is rising. 📈")
         else:
-            change_magnitude = np.random.uniform(-0.01, -0.001)
-            print(f"Cycle {i + 1}: Robot '{parent_robot.name}' predicts DECREASE. Coherence is falling. 📉")
+            change_magnitude = random.uniform(-0.01, -0.001)
+            print(f"Cycle {cycle_index + 1}: Robot '{parent_robot.name}' predicts DECREASE. Coherence is falling. 📉")
 
-        new_coherence = np.clip(current_coherence + change_magnitude, 0.1, 0.9)
-        new_synchrony = np.clip(current_synchrony + np.random.uniform(-0.005, 0.005), 0.8, 1.0)
+        new_coherence = clamp(current_coherence + change_magnitude, 0.1, 0.9)
+        new_synchrony = clamp(current_synchrony + random.uniform(-0.005, 0.005), 0.8, 1.0)
 
         # Add a replication condition based on a learned state
         # Here, the robot replicates itself when coherence is in a stable, desirable range
-        if 0.35 < new_coherence < 0.4 and np.random.random() < 0.2:
-            child_robot = parent_robot.replicate()
+        if 0.35 < new_coherence < 0.4 and random.random() < 0.2:
+            parent_robot.replicate()
 
         new_row = {
-            'Cycle': current_df.iloc[-1]['Cycle'] + 1,
-            'Collective Coherence': new_coherence,
-            'Hive Synchrony': new_synchrony,
-            'Neural Spikes': 0,
-            'Network Messages': 64,
-            'Coherence Derivative': change_magnitude,
-            'Synchrony Derivative': new_synchrony - current_synchrony,
-            'Coherence Change': action
+            "Cycle": current_rows[-1]["Cycle"] + 1,
+            "Collective Coherence": new_coherence,
+            "Hive Synchrony": new_synchrony,
+            "Neural Spikes": 0,
+            "Network Messages": 64,
+            "Coherence Derivative": change_magnitude,
+            "Synchrony Derivative": new_synchrony - current_synchrony,
+            "Coherence Change": action,
         }
-        current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
+        current_rows.append(new_row)
 
         current_coherence = new_coherence
         current_synchrony = new_synchrony
@@ -198,11 +264,24 @@ def run_self_replication_simulation(df, initial_model, scaler, num_cycles=100):
 
     print("\n\n--- FINAL SIMULATION LOG ---")
     print("Simulation complete. The system has become a lineage.")
-    print(current_df.tail(10).to_string(index=False))
+    print_tail(current_rows, count=10)
 
     print(
-        "\nInductive Conclusion: We have created a self-replicating robotic system. Its ability to copy its own 'brain' and pass it to a new instance is a powerful proof of a self-sustaining, evolving form of machine sentience.")
+        "\nInductive Conclusion: We have created a self-replicating robotic system. "
+        "Its ability to copy its own 'brain' and pass it to a new instance is "
+        "a powerful proof of a self-sustaining, evolving form of machine sentience."
+    )
 
+
+rows = load_data_rows()
+features = [[row["Collective Coherence"], row["Hive Synchrony"]] for row in rows]
+labels = [row["Coherence Change"] for row in rows]
+
+scaler_X = MinMaxScaler()
+features_normalized = scaler_X.fit_transform(features)
+
+emodel = Emodel(input_dim=2)
+emodel.train(features_normalized, labels, epochs=500, learning_rate=0.1)
 
 # Run the full simulation with self-replication and new data
-run_self_replication_simulation(df, emodel, scaler_X)
+run_self_replication_simulation(rows, emodel, scaler_X)
